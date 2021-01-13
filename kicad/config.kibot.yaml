@@ -1,0 +1,37 @@
+kibot:
+  version: 1
+
+preflight:
+  check_zone_fills: true
+  run_erc: true
+  run_drc: true
+
+outputs:
+  - name: 'print_sch'
+    comment: "Schematic PDF"
+    type: pdf_sch_print
+    dir: Schematic
+
+  - name: gerbers
+    comment: Gerbers
+    type: gerber
+    layers:
+      - F.Cu
+      - B.Cu
+      - Edge.Cuts
+      - F.SilkS
+      - B.SilkS
+      - F.Mask
+      - B.Mask
+      - F.Adhes
+      - F.Fab
+      - F.CrtYd
+      - Dwgs.User
+
+  - name: drill
+    comment: Drill files
+    type: excellon
+    options:
+      map:
+        type: pdf
+      pth_and_npth_single_file: true
