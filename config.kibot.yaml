@@ -20,17 +20,15 @@ outputs:
     comment: Gerbers
     type: gerber
     layers:
-      - F.Cu
-      - B.Cu
+      - Front
+      - Back
       - Edge.Cuts
       - F.SilkS
       - B.SilkS
       - F.Mask
       - B.Mask
-      - F.Adhes
       - F.Fab
       - F.CrtYd
-      - Dwgs.User
 
   - name: drill
     comment: Drill files
