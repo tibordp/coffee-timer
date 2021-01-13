@@ -17,7 +17,7 @@ jobs:
           # Required - kibot config file
           config: kicad/config.kibot.yaml
           # optional - prefix to output defined in config
-          dir: output
+          dir: kicad/output
           # optional - schematic file
           schema: "kicad/*.sch"
           # optional - PCB design file

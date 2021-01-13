@@ -6,7 +6,7 @@ preflight:
   run_erc: true
   run_drc: true
   filters:
-    - filter: 'Optional filter description'
+    - filter: 'Ignore unconnected copper islands'
       error: '22'
       regex:  'Zone Outline'
 
