@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <avr/interrupt.h>
 #include <avr/sleep.h>
+#include <avr/eeprom.h>
 
 #define SHIFT_DATA 0
 #define SHIFT_LATCH 2
@@ -22,23 +23,71 @@
 #define STATE_SETTING_MINUTES_1 61
 #define STATE_SETTING_MINUTES_2 62
 
+#define STATE_CALLIBRATING_START 70
+#define STATE_CALLIBRATING_START_1 71
+#define STATE_CALLIBRATING_START_2 72
+#define STATE_CALLIBRATING_START_3 73
+
+#define STATE_CALLIBRATING 81
+#define STATE_CALLIBRATING_1 82
+#define STATE_CALLIBRATING_2 83
+#define STATE_CALLIBRATING_3 84
+
+
 #define LED_ARRAY_DOT 1
 #define BUTTON_DEBOUNCE_MS 100
 #define EDIT_START_THRESHOLD 1000
+#define CAL_START_THRESHOLD 4000
 #define EDIT_TIMEOUT 10000
+#define ERR_TIMEOUT 1000
+
+#define VISION_PERSISTENCE delayMicroseconds(200)
+#define CALLIBRATION_OK(v) (((v) > 0.2) && ((v) < 5))
+#define COFFEETIME_OK(v) (((v) > 0) && ((v) < 99U*60U*1000U))
+#define CLEAR shiftSegments(buzzing, 0, 0b0000)
+
+/*
+      0
+   5     1
+      6
+   4     2
+      3     7
+*/
 
 const uint8_t digits[] = {
-    0b11111100,
-    0b01100000,
-    0b11011010,
-    0b11110010,
-    0b01100110,
-    0b10110110,
-    0b10111110,
-    0b11100000,
-    0b11111110,
-    0b11110110,
+    //01234567  
+    0b11111100, // 0
+    0b01100000, // 1
+    0b11011010, // 2
+    0b11110010, // 3
+    0b01100110, // 4
+    0b10110110, // 5
+    0b10111110, // 6
+    0b11100000, // 7
+    0b11111110, // 8
+    0b11110110, // 9
 };
+
+const uint8_t cal[] = {
+    //01234567  
+    0b10011100,
+    0b11101110,
+    0b00011100
+};
+
+const uint8_t spinner[] = {
+    //01234567  
+    0b10000000,
+    0b01000000,
+    0b00100000,
+    0b00010000,
+    0b00001000,
+    0b00000100,
+};
+
+const uint8_t err = 
+    //01234567  
+    0b10011110;
 
 void shiftSegments(bool buzzer, uint8_t segments, uint8_t groundMask)
 {
@@ -77,40 +126,31 @@ void shiftSegments(bool buzzer, uint8_t segments, uint8_t groundMask)
   digitalWrite(SHIFT_LATCH, LOW);
 }
 
-void writeNumber(bool buzzer, uint16_t number)
-{
-  shiftSegments(buzzer, digits[number % 10], 0b0001);
-  delayMicroseconds(200);
-  number /= 10;
-  shiftSegments(buzzer, number == 0 ? 0 : digits[number % 10], 0b0010);
-  delayMicroseconds(200);
-  number /= 10;
-  shiftSegments(buzzer, number == 0 ? 0 : digits[number % 10], 0b0100);
-  delayMicroseconds(200);
-  number /= 10;
-  shiftSegments(buzzer, number == 0 ? 0 : digits[number % 10], 0b1000);
-  delayMicroseconds(200);
-}
+uint8_t selectedButton = 1;
+uint8_t state = 0;
 
-void writeDuration(bool buzzer, uint32_t milliseconds, uint8_t mask)
-{
-  int seconds = ((milliseconds + 500) / 1000) % 60; // round up
-  int minutes = ((milliseconds + 500) / 60000);
+uint32_t calStart = 0;
+uint32_t calMinutes = 0;
 
-  shiftSegments(buzzer, digits[seconds % 10], 0b0001 & mask);
-  delayMicroseconds(200);
-  shiftSegments(buzzer, digits[seconds / 10 % 10], 0b0010 & mask);
-  delayMicroseconds(200);
-  shiftSegments(buzzer, digits[minutes % 10] + LED_ARRAY_DOT, 0b0100 & mask);
-  delayMicroseconds(200);
-  shiftSegments(buzzer, digits[minutes / 10 % 10], 0b1000 & mask);
-  delayMicroseconds(200);
-  // This is to ensure even brightness of all four digits if we take a long time
-  // after this function is called.
-  shiftSegments(buzzer, 0, 0b0000);
-}
+uint32_t startedAt = 0;
+uint32_t lastInteraction = 0;
 
-void turnOffDisplay(bool buzzer) { shiftSegments(buzzer, 0, 0b0000); }
+uint32_t coffeeTime[2] = {240000, 180000};
+uint8_t editMinutes = 0;
+uint8_t editSeconds = 0;
+
+bool buzzing = false;
+
+bool shortBeep = false;
+uint32_t shortBeepStart = 0;
+uint32_t sleepTimeoutStart = 0;
+
+float callibration = 1.0;
+
+// EEPROM variables
+float EEMEM callibrationMem = 1.0;
+uint32_t EEMEM coffeeTime1Mem = 240000;
+uint32_t EEMEM coffeeTime2Mem = 180000;
 
 void setup()
 {
@@ -125,29 +165,107 @@ void setup()
   PCMSK |= _BV(PCINT3) | _BV(PCINT4);
   // Disable ADC
   ADCSRA &= ~_BV(ADEN);
+
+  float maybeCal = eeprom_read_float(&callibrationMem);
+  if (CALLIBRATION_OK(maybeCal)) {
+    callibration = maybeCal;
+  }
+
+  uint32_t maybeCoffeeTime1 = eeprom_read_dword(&coffeeTime1Mem);
+  if (COFFEETIME_OK(maybeCoffeeTime1)) {
+    coffeeTime[0] = maybeCoffeeTime1;
+  }
+
+  uint32_t maybeCoffeeTime2 = eeprom_read_dword(&coffeeTime2Mem);
+  if (COFFEETIME_OK(maybeCoffeeTime2)) {
+    coffeeTime[1] = maybeCoffeeTime2;
+  }
 }
+
+void writeNumber(uint16_t number)
+{
+  shiftSegments(buzzing, digits[number % 10], 0b0001);
+  VISION_PERSISTENCE;
+  number /= 10;
+  shiftSegments(buzzing, number == 0 ? 0 : digits[number % 10], 0b0010);
+  VISION_PERSISTENCE;
+  number /= 10;
+  shiftSegments(buzzing, number == 0 ? 0 : digits[number % 10], 0b0100);
+  VISION_PERSISTENCE;
+  number /= 10;
+  shiftSegments(buzzing, number == 0 ? 0 : digits[number % 10], 0b1000);
+  VISION_PERSISTENCE;
+  CLEAR;
+}
+
+void writeDuration(uint32_t milliseconds, uint8_t mask)
+{
+  int seconds = ((milliseconds + 500) / 1000) % 60; // round up
+  int minutes = ((milliseconds + 500) / 60000);
+
+  shiftSegments(buzzing, digits[seconds % 10], 0b0001 & mask);
+  VISION_PERSISTENCE;
+  shiftSegments(buzzing, digits[seconds / 10 % 10], 0b0010 & mask);
+  VISION_PERSISTENCE;
+  shiftSegments(buzzing, digits[minutes % 10] + LED_ARRAY_DOT, 0b0100 & mask);
+  VISION_PERSISTENCE;
+  shiftSegments(buzzing, digits[minutes / 10 % 10], 0b1000 & mask);
+  VISION_PERSISTENCE;
+  CLEAR;
+}
+
+void writeCalibrating(int sequence)
+{
+  if (sequence == -1) {
+    shiftSegments(buzzing, 0, 0b0001);
+  } else {
+    shiftSegments(buzzing, spinner[sequence % 6], 0b0001);
+  }
+  VISION_PERSISTENCE;
+
+  for (int i = 2; i >= 0; i--) {
+    shiftSegments(buzzing, cal[i], 0b1000 >> i);
+    VISION_PERSISTENCE;
+  }
+  CLEAR;
+} 
+
+void writeCalibratingStart(int minutes, uint8_t mask)
+{
+  shiftSegments(buzzing, digits[minutes % 10], 0b0001 & mask);
+  VISION_PERSISTENCE;
+
+  if (minutes / 10 > 0) {
+    shiftSegments(buzzing, digits[minutes / 10], 0b0010 & mask);
+  } else {
+    shiftSegments(buzzing, 0, 0b0010);
+  }
+  VISION_PERSISTENCE;
+
+  shiftSegments(buzzing, 0, 0b0100);
+  VISION_PERSISTENCE;
+
+  shiftSegments(buzzing, cal[0], 0b1000);
+  VISION_PERSISTENCE;
+  CLEAR;
+} 
+
+void writeError()
+{
+  for (int i = 3; i >= 0; i--) {
+    shiftSegments(buzzing, err, 0b1000 >> i);
+    VISION_PERSISTENCE;
+  }
+  CLEAR;
+}
+
+void turnOffDisplay() { shiftSegments(buzzing, 0, 0b0000); }
 
 ISR(PCINT0_vect)
 {
   // Empty ISR, we only need it to be able to wake up from sleep
   // on button press.
 }
-
-uint8_t selectedButton = 1;
-
-uint8_t state = 0;
-uint32_t startedAt = 0;
-uint32_t lastInteraction = 0;
-
-uint32_t coffeeTime[2] = {240000, 180000};
-uint8_t editMinutes = 0;
-uint8_t editSeconds = 0;
-
-bool buzzing = false;
-
-bool shortBeep = false;
-uint32_t shortBeepStart = 0;
-uint32_t sleepTimeoutStart = 0;
 
 #define CHECK_BUTTON_CUSTOM(shouldBePressed, timeout) \
   (buttonPressed ^ (shouldBePressed) &&               \
@@ -171,9 +289,34 @@ void goToSleep()
   sleep_mode();
 }
 
+bool callibrate() {
+  float duration = (float)(millis() - calStart);
+
+  float ratio = 60000.0 * ((float) calMinutes) / duration;
+
+  if (CALLIBRATION_OK(ratio)) {
+    // Skip updating EEPROM if the value is significantly outside normal range, as this could lead
+    // to an unuasable UI.
+    eeprom_write_float(&callibrationMem, ratio);
+    callibration = ratio;
+    return true;
+  } else {
+    return false;
+  }
+}
+
+void writeCoffeeTime(uint8_t button, uint32_t value) {
+  if (button == 0) {
+    eeprom_write_dword(&coffeeTime1Mem, value);
+  } else {
+    eeprom_write_dword(&coffeeTime2Mem, value);
+  }
+  coffeeTime[button] = value;
+}
+
 void loop()
 {
-  uint32_t currentTime = millis();
+  uint32_t currentTime = (uint32_t)(((float)millis()) * callibration);
   uint8_t button1Pressed = digitalRead(BUTTON_1);
   uint8_t button2Pressed = digitalRead(BUTTON_2);
   uint8_t buttonPressed = button1Pressed && button2Pressed;
@@ -202,17 +345,87 @@ void loop()
       startedAt = currentTime;
       state = STATE_RUNNING;
     }
-    else if (CHECK_BUTTON_CUSTOM(true, 1000))
+    else if (CHECK_BUTTON_CUSTOM(true, EDIT_START_THRESHOLD))
     {
       editSeconds = 0;
       editMinutes = 0;
       state = STATE_SETTING_MINUTES_1;
     }
     break;
+  case STATE_CALLIBRATING_START_3:
+    if (BUTTON_UP)
+    {
+      state = STATE_CALLIBRATING_START;
+    }
+    break;    
+  case STATE_CALLIBRATING_START_1:
+    if (BUTTON_UP)
+    {
+      state = STATE_CALLIBRATING_START;
+    }
+    break;
+  case STATE_CALLIBRATING_START:
+    if (BUTTON_DOWN) {
+      if (button2Pressed) {
+        calStart = millis();
+        SHORT_BEEP;
+        state = STATE_CALLIBRATING_1;
+      } else {
+        state = STATE_CALLIBRATING_START_2;
+      }
+    }
+    break;   
+  case STATE_CALLIBRATING_START_2:
+    if (BUTTON_UP) {
+      SHORT_BEEP;
+      calMinutes = calMinutes + 1;
+      if (calMinutes == 61) {
+        calMinutes = 1;
+      }
+      state = STATE_CALLIBRATING_START;
+    }
+    break;       
+  case STATE_CALLIBRATING_1:
+    if (BUTTON_UP)
+    {
+      state = STATE_CALLIBRATING;
+    }
+    break; 
+  case STATE_CALLIBRATING:
+    if (BUTTON_DOWN)
+    {
+      if (!callibrate()) {
+        state = STATE_CALLIBRATING_2;
+      } else {
+        state = STATE_DEFAULT_1;
+      }
+    }
+    break;     
+  case STATE_CALLIBRATING_2:
+    if (BUTTON_UP)
+    {
+      state = STATE_CALLIBRATING_3;
+    } else if (currentTime - lastInteraction > ERR_TIMEOUT)
+    {
+      state = STATE_DEFAULT_1;
+    }
+    break;               
+  case STATE_CALLIBRATING_3:
+    if (currentTime - lastInteraction > ERR_TIMEOUT)
+    {
+      state = STATE_DEFAULT;
+      sleepTimeoutStart = currentTime;
+    }
+    break;         
   case STATE_SETTING_MINUTES_1:
     if (BUTTON_UP)
     {
       state = STATE_SETTING_MINUTES;
+    } else if (CHECK_BUTTON_CUSTOM(true, CAL_START_THRESHOLD))
+    {
+      SHORT_BEEP;
+      calMinutes = 1;
+      state = STATE_CALLIBRATING_START_3;
     }
     break;
   case STATE_SETTING_MINUTES:
@@ -266,7 +479,7 @@ void loop()
     else if (CHECK_BUTTON_CUSTOM(true, EDIT_START_THRESHOLD))
     {
       SHORT_BEEP;
-      coffeeTime[selectedButton] = EDITED_TIME;
+      writeCoffeeTime(selectedButton, EDITED_TIME);
       state = STATE_DEFAULT_1;
     }
     break;
@@ -312,27 +525,39 @@ void loop()
     {
       buzzing = false;
     }
-    turnOffDisplay(buzzing);
+    turnOffDisplay();
     break;
+  case STATE_CALLIBRATING_START_3:
+    writeCalibrating(-1);
+    break;
+  case STATE_CALLIBRATING_START:
+  case STATE_CALLIBRATING_START_1:
+  case STATE_CALLIBRATING_START_2:
+    writeCalibratingStart(calMinutes, (currentTime / 300) % 2 ? 0b0000 : 0b1111);
+    break;    
+  case STATE_CALLIBRATING:
+  case STATE_CALLIBRATING_1:
+    writeCalibrating(currentTime / 100);
+    break;        
+  case STATE_CALLIBRATING_2:
+  case STATE_CALLIBRATING_3:
+    writeError();
+    break;       
   case STATE_SETTING_SECONDS:
   case STATE_SETTING_SECONDS_1:
   case STATE_SETTING_SECONDS_2:
-    writeDuration(buzzing, EDITED_TIME,
-                  (currentTime / 300) % 2 ? 0b1100 : 0b1111);
+    writeDuration(EDITED_TIME, (currentTime / 300) % 2 ? 0b1100 : 0b1111);
     break;
   case STATE_SETTING_MINUTES:
   case STATE_SETTING_MINUTES_1:
   case STATE_SETTING_MINUTES_2:
-    writeDuration(buzzing, EDITED_TIME,
-                  (currentTime / 300) % 2 ? 0b0011 : 0b1111);
+    writeDuration(EDITED_TIME, (currentTime / 300) % 2 ? 0b0011 : 0b1111);
     break;
   case STATE_RUNNING_1:
-    writeDuration(buzzing, coffeeTime[selectedButton], 0b1111);
+    writeDuration(coffeeTime[selectedButton], 0b1111);
     break;
   case STATE_RUNNING:
-    writeDuration(buzzing,
-                  coffeeTime[selectedButton] - (currentTime - startedAt),
-                  0b1111);
+    writeDuration(coffeeTime[selectedButton] - (currentTime - startedAt), 0b1111);
     break;
   case STATE_BUZZING:
     int bucket = (currentTime - startedAt) % 1000;
@@ -340,12 +565,12 @@ void loop()
     if ((segment < 8) && (segment % 2 == 0))
     {
       buzzing = true;
-      writeDuration(buzzing, 0, 0b1111);
+      writeDuration(0, 0b1111);
     }
     else
     {
       buzzing = false;
-      turnOffDisplay(buzzing);
+      turnOffDisplay();
     }
     break;
   }
